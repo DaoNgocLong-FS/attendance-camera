@@ -177,7 +177,6 @@ python -c "import torch, mediapipe as mp; print('CUDA:', torch.cuda.is_available
 | AdaFace pretrained `adaface_ir50_ms1mv2.ckpt` | ~250 MB | Chỉ cần khi train lại — xem [§7](#7-huấn-luyện-model) |
 
 > **Tải model nhận diện đã fine-tune (`last.pt`):**
-> 👉 *(Dán link Google Drive của bạn vào đây)*
 > Sau khi tải, đặt file vào: `checkpoints/recognition/last.pt`
 
 **Dataset** (chỉ cần nếu muốn train lại):
