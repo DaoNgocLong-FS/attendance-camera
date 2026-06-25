@@ -28,6 +28,7 @@ sys.path.insert(0, str(ROOT / "pipeline"))
 from alignment import FaceAligner
 from extract_embedding import EmbeddingExtractor
 from database import AttendanceDB
+from confirm_tracker import ContinuousConfirmTracker
 from ultralytics import YOLO
 
 
@@ -41,6 +42,7 @@ class RecognitionResult:
     live_score: float
     decision: str
     logged: bool
+    progress: float = 0.0   # 0..1 — tiến trình xác nhận liên tục (để vẽ thanh)
 
 
 class AttendancePipeline:
@@ -57,6 +59,7 @@ class AttendancePipeline:
         live_threshold: float = 0.70,
         cooldown_min: int = 5,
         crop_margin: float = 0.3,
+        confirm_seconds: float = 2.0,
     ):
         self.detector = YOLO(detector_weights)
         self.det_conf = det_conf
@@ -80,6 +83,8 @@ class AttendancePipeline:
         self.live_threshold = live_threshold
         self.cooldown = timedelta(minutes=cooldown_min)
         self.crop_margin = crop_margin
+        # Yêu cầu nhận diện liên tục đủ confirm_seconds mới ghi chấm công.
+        self.confirm = ContinuousConfirmTracker(required_seconds=confirm_seconds)
         self._refresh_gallery()
 
     def _refresh_gallery(self):
@@ -154,20 +159,28 @@ class AttendancePipeline:
             else:
                 live_score = 1.0
 
+            progress = 0.0
             if emp_id is None or sim < self.sim_threshold:
                 decision, logged = "unknown", False
             elif self.antispoof is not None and live_score < self.live_threshold:
                 decision, logged = "spoof", False
             else:
-                last = self.db.last_attendance_today(emp_id)
-                if last is not None and datetime.utcnow() - last < self.cooldown:
-                    decision, logged = "cooldown", False
-                else:
-                    if log:
+                # Yêu cầu nhận diện LIÊN TỤC đủ confirm_seconds mới chấm công.
+                # Tránh ghi trùng hàng loạt khi một người đứng lâu trước camera.
+                progress, just_confirmed = self.confirm.update(emp_code)
+                if just_confirmed:
+                    last = self.db.last_attendance_today(emp_id)
+                    if last is not None and datetime.utcnow() - last < self.cooldown:
+                        decision, logged = "cooldown", False
+                    elif log:
                         self.db.log_attendance(emp_id, sim_score=sim, live_score=live_score)
                         decision, logged = "logged", True
                     else:
                         decision, logged = "would_log", False
+                elif self.confirm.is_confirmed(emp_code):
+                    decision, logged = "present", False     # đã chấm công, vẫn đứng trước camera
+                else:
+                    decision, logged = "confirming", False  # đang đếm tới đủ giây
 
             if prefix:
                 decision = f"{prefix}+{decision}"
@@ -176,7 +189,9 @@ class AttendancePipeline:
                 bbox=bbox, aligned_face=aligned,
                 employee_code=emp_code, employee_name=emp_name,
                 sim_score=sim, live_score=live_score,
-                decision=decision, logged=logged))
+                decision=decision, logged=logged, progress=progress))
+
+        self.confirm.cleanup()  # quên timer của mặt đã rời khung
         return results
 
     def enroll(self, code: str, name: str, frames_bgr: List[np.ndarray]) -> int:
@@ -202,12 +217,20 @@ class AttendancePipeline:
 def draw_result(frame, results: List[RecognitionResult]):
     for r in results:
         x1, y1, x2, y2, _ = r.bbox
+        show_bar = False
         if r.logged or r.decision == "would_log":
             color = (0, 255, 0)
             txt = f"{r.employee_name} sim={r.sim_score:.2f}"
         elif "spoof" in r.decision:
             color = (0, 0, 255)
             txt = f"SPOOF live={r.live_score:.2f}"
+        elif "present" in r.decision:
+            color = (0, 200, 0)
+            txt = f"{r.employee_name} (da cham cong)"
+        elif "confirming" in r.decision:
+            color = (0, 255, 255)
+            txt = f"{r.employee_name}? xac nhan {int(r.progress * 100)}%"
+            show_bar = True
         elif "cooldown" in r.decision:
             color = (255, 200, 0)
             txt = f"{r.employee_name} (cooldown)"
@@ -220,4 +243,8 @@ def draw_result(frame, results: List[RecognitionResult]):
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         cv2.putText(frame, txt, (x1, max(15, y1 - 8)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+        if show_bar:  # thanh tiến trình xác nhận liên tục, vẽ dưới khung mặt
+            by = y2 + 6
+            cv2.rectangle(frame, (x1, by), (x2, by + 6), (80, 80, 80), -1)
+            cv2.rectangle(frame, (x1, by), (x1 + int((x2 - x1) * r.progress), by + 6), (0, 255, 0), -1)
     return frame

@@ -112,14 +112,12 @@ attendance-camera/
 │   ├── camera_demo.py              # Demo realtime qua webcam
 │   ├── enroll.py                   # Đăng ký nhân viên qua webcam
 │   ├── database.py                 # SQLite ORM (SQLAlchemy)
+│   ├── confirm_tracker.py          # Xác nhận nhận diện liên tục N giây (chống ghi trùng)
 │   └── test_rtsp.py                # Test camera IP qua RTSP
 │
 ├── web/                            # WEB DASHBOARD (Flask)
 │   ├── app.py                      # Backend: suy ra phiên check-in/out từ log
 │   ├── templates/index.html        # Giao diện (tabs + timeline, không cần internet)
-│   ├── attendance_session.py       # Logic phiên check-in/out (tham khảo)
-│   ├── confirm_tracker.py          # Bộ đếm xác nhận N giây liên tục (tham khảo)
-│   ├── camera_demo_integration.py  # Mẫu tích hợp vào vòng lặp camera
 │   ├── requirements_web.txt        # Phụ thuộc riêng cho web (Flask)
 │   └── README_web.md               # Hướng dẫn riêng cho web
 │
@@ -260,10 +258,13 @@ python pipeline\enroll.py --detector detection_model\best.pt --recognition check
 python pipeline\camera_demo.py --detector detection_model\best.pt --recognition checkpoints\recognition\last.pt --db attendance.db --device cuda --cam 0 --sim 0.30
 ```
 Thêm `--antispoof checkpoints\antispoof\best.pt` để bật chống giả mạo.
+Thêm `--confirm 2.0` để chỉnh số giây phải nhận diện **liên tục** trước khi chấm công
+(mặc định 2s) — cơ chế này tránh ghi trùng hàng loạt khi một người đứng lâu trước camera.
 
 **Phím tắt:** `q` thoát · `s` bật/tắt ghi log · `l` liệt kê chấm công hôm nay · `r` xoay ảnh 180°.
 
-**Màu khung:** 🟢 đã chấm công · 🟠 unknown · 🔴 spoof · 🟡 cooldown (vừa chấm gần đây).
+**Màu khung:** 🟢 đã chấm công · 🟡 đang xác nhận (kèm thanh tiến trình) · 🟠 unknown ·
+🔴 spoof · 🟡 cooldown (vừa chấm gần đây).
 
 ---
 

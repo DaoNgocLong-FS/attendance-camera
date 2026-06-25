@@ -78,6 +78,8 @@ def main():
     ap.add_argument("--live", type=float, default=0.70)
     ap.add_argument("--det-conf", type=float, default=0.4)
     ap.add_argument("--cooldown", type=int, default=5)
+    ap.add_argument("--confirm", type=float, default=2.0,
+                    help="So giay nhan dien lien tuc truoc khi cham cong (chong ghi trung)")
     ap.add_argument("--rotate180", action="store_true",
                     help="Xoay ảnh 180° (dùng khi IVCam bị lộn ngược)")
     args = ap.parse_args()
@@ -93,6 +95,7 @@ def main():
         sim_threshold=args.sim,
         live_threshold=args.live,
         cooldown_min=args.cooldown,
+        confirm_seconds=args.confirm,
     )
     print(f"Gallery: {len(pipeline.gallery_ids)} employees, "
           f"{int(pipeline.gallery_embs.shape[0])} embeddings")
