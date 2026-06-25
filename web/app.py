@@ -1,18 +1,26 @@
 """
-app.py — Web application Chấm công (Flask)
-==========================================
-Web app đọc cơ sở dữ liệu attendance.db và hiển thị dashboard:
-tổng quan, lịch sử check-in/out, danh sách nhân viên.
+app.py — Web Dashboard Chấm công (Flask)
+========================================
+Đọc cơ sở dữ liệu attendance.db (do camera_demo.py ghi) và hiển thị dashboard
+check-in / check-out một cách khoa học.
+
+NGUYÊN LÝ (quan trọng):
+    Camera ghi mỗi lần nhận diện thành MỘT dòng trong bảng `attendance`
+    (timestamp, sim_score, live_score). Đây là "log sự kiện thô".
+
+    Web app này KHÔNG hiển thị log thô. Thay vào đó nó SUY RA phiên làm việc:
+        Với mỗi (nhân viên, ngày):
+            - Lần nhận diện ĐẦU trong ngày  -> GIỜ VÀO  (check-in)
+            - Lần nhận diện CUỐI trong ngày -> GIỜ RA   (check-out)
+            - Số giờ làm = giờ ra - giờ vào
+    => Cho biết mỗi người vào/ra lúc nào trong ngày, không cần sửa pipeline camera.
 
 Chạy:
     pip install flask
     python app.py
-    # hoặc chỉ định DB:  python app.py --db D:\attendance-camera\attendance.db
+    # hoặc:  python app.py --db D:\attendance-camera\attendance.db
 
-Sau đó mở trình duyệt: http://localhost:5000
-
-Chạy SONG SONG với camera_demo.py (OpenCV) trong demo hybrid:
-camera_demo.py ghi vào attendance.db, web app này đọc và hiển thị.
+Mở trình duyệt: http://localhost:5000
 """
 from flask import Flask, jsonify, render_template, request
 import sqlite3
@@ -21,6 +29,14 @@ import sys
 from datetime import datetime, date, timedelta
 
 app = Flask(__name__)
+
+# Cửa sổ giờ hiển thị trên trục thời gian (6h sáng -> 22h tối)
+DAY_START_HOUR = 6
+DAY_END_HOUR = 22
+
+# Khoảng cách tối thiểu giữa lần đầu và lần cuối để coi là đã "tan ca".
+# Nếu một người chỉ thoáng qua camera (vài giây) thì coi như mới chỉ check-in.
+MIN_SESSION_SECONDS = 60
 
 
 def get_db_path():
@@ -34,23 +50,19 @@ def get_db_path():
 DB_PATH = get_db_path()
 
 
-# ---------------- DB helpers (tự dò schema) ----------------
+# ---------------- DB helpers (tự dò schema để linh hoạt) ----------------
 def connect():
     return sqlite3.connect(DB_PATH)
+
 
 def list_tables(conn):
     rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     return [r[0] for r in rows if not r[0].startswith("sqlite_")]
 
+
 def columns_of(conn, t):
     return [r[1] for r in conn.execute(f'PRAGMA table_info("{t}")').fetchall()]
 
-def find_time_col(cols):
-    for c in cols:
-        lc = c.lower()
-        if "timestamp" in lc or "time" in lc or "date" in lc or "checkin" in lc:
-            return c
-    return None
 
 def find_col(cols, *keys):
     for c in cols:
@@ -59,47 +71,157 @@ def find_col(cols, *keys):
             return c
     return None
 
-def find_session_table(conn, tables):
-    for t in tables:
-        lc = [c.lower() for c in columns_of(conn, t)]
-        if any("check_in" in c or "checkin" in c for c in lc) and \
-           any("check_out" in c or "checkout" in c for c in lc):
-            return t
-    return None
-
-def find_attendance_table(conn, tables):
-    for t in tables:
-        if find_time_col(columns_of(conn, t)):
-            return t
-    return None
-
-def find_employee_table(conn, tables, att):
-    for t in tables:
-        if t == att:
-            continue
-        lc = [c.lower() for c in columns_of(conn, t)]
-        if any("name" in c for c in lc) or any(c in ("code", "id", "emp_code") for c in lc):
-            return t
-    return None
-
-def rows_to_dicts(conn, table):
-    cur = conn.execute(f'SELECT * FROM "{table}"')
-    cols = [d[0] for d in cur.description]
-    return [dict(zip(cols, r)) for r in cur.fetchall()], cols
-
 
 def parse_dt(s):
     if not s:
         return None
+    if isinstance(s, datetime):
+        return s
+    s = str(s)
     try:
         return datetime.fromisoformat(s)
     except Exception:
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S"):
+        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S",
+                    "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S"):
             try:
                 return datetime.strptime(s, fmt)
             except Exception:
                 pass
     return None
+
+
+def fmt_duration(seconds):
+    """123 phút -> '2h 03m'. None/âm -> '—'."""
+    if seconds is None or seconds < 0:
+        return "—"
+    m = int(round(seconds / 60))
+    h, m = divmod(m, 60)
+    if h and m:
+        return f"{h}h {m:02d}m"
+    if h:
+        return f"{h}h"
+    return f"{m}m"
+
+
+# ---------------- Suy ra phiên làm việc từ log sự kiện ----------------
+def build_sessions(conn):
+    """
+    Đọc bảng employees + attendance (log thô), suy ra danh sách phiên:
+      mỗi (employee, work_date) -> 1 phiên với check_in / check_out / duration.
+
+    Trả về:
+      sessions: list dict đã sort theo (date desc, check_in)
+      employees: list dict thông tin nhân viên (đã ẩn embedding)
+    """
+    tables = list_tables(conn)
+
+    # --- Tìm bảng nhân viên (có cột name + code) ---
+    emp_table = None
+    for t in tables:
+        cols = columns_of(conn, t)
+        if find_col(cols, "name") and find_col(cols, "code", "id"):
+            # ưu tiên bảng có cột embedding (đúng là bảng employees)
+            if find_col(cols, "embed", "blob") or t.lower().startswith("employee"):
+                emp_table = t
+                break
+    if emp_table is None:
+        for t in tables:
+            if find_col(columns_of(conn, t), "name"):
+                emp_table = t
+                break
+
+    # --- Tìm bảng log chấm công (có cột thời gian + employee_id) ---
+    att_table = None
+    for t in tables:
+        if t == emp_table:
+            continue
+        cols = columns_of(conn, t)
+        if find_col(cols, "timestamp", "time", "date") and find_col(cols, "employee", "emp_id", "code"):
+            att_table = t
+            break
+
+    # Map id -> (code, name) từ bảng nhân viên
+    id2emp = {}
+    employees = []
+    if emp_table:
+        cols = columns_of(conn, emp_table)
+        id_col = find_col(cols, "id") or "id"
+        code_col = find_col(cols, "code") or id_col
+        name_col = find_col(cols, "name") or code_col
+        created_col = find_col(cols, "created", "enroll", "date")
+        keep = [c for c in cols if not any(x in c.lower()
+                for x in ("embed", "vector", "feature", "blob", "dim", "num_"))]
+        for r in conn.execute(f'SELECT * FROM "{emp_table}"').fetchall():
+            row = dict(zip(cols, r))
+            eid = row.get(id_col)
+            code = row.get(code_col, "")
+            name = row.get(name_col, "")
+            id2emp[eid] = (str(code), str(name))
+            id2emp[str(code)] = (str(code), str(name))  # phòng khi log lưu code
+            employees.append({
+                "code": str(code),
+                "name": str(name),
+                "enrolled_at": (parse_dt(row.get(created_col)).strftime("%Y-%m-%d %H:%M")
+                                if created_col and parse_dt(row.get(created_col)) else "—"),
+                "_id": eid,
+            })
+
+    # Gom log theo (employee, ngày)
+    # groups[(emp_key, date)] = list[datetime]
+    groups = {}
+    if att_table:
+        cols = columns_of(conn, att_table)
+        tcol = find_col(cols, "timestamp", "time", "date")
+        ecol = find_col(cols, "employee", "emp_id") or find_col(cols, "code")
+        for r in conn.execute(f'SELECT * FROM "{att_table}"').fetchall():
+            row = dict(zip(cols, r))
+            dt = parse_dt(row.get(tcol))
+            if dt is None:
+                continue
+            emp_key = row.get(ecol)
+            d = dt.date()
+            groups.setdefault((emp_key, d), []).append(dt)
+
+    # Dựng phiên từ mỗi nhóm
+    sessions = []
+    for (emp_key, d), times in groups.items():
+        times.sort()
+        first, last = times[0], times[-1]
+        span = (last - first).total_seconds()
+        code, name = id2emp.get(emp_key, id2emp.get(str(emp_key), ("?", str(emp_key))))
+
+        has_checkout = span >= MIN_SESSION_SECONDS
+        in_min = first.hour * 60 + first.minute + first.second / 60.0
+        out_min = (last.hour * 60 + last.minute + last.second / 60.0) if has_checkout else None
+
+        sessions.append({
+            "code": code,
+            "name": name,
+            "date": d.isoformat(),
+            "check_in": first.strftime("%H:%M"),
+            "check_out": last.strftime("%H:%M") if has_checkout else None,
+            "in_min": round(in_min, 2),
+            "out_min": round(out_min, 2) if out_min is not None else None,
+            "duration": fmt_duration(span) if has_checkout else "—",
+            "detections": len(times),
+            "open": not has_checkout,  # chỉ mới thấy 1 lần / chưa thấy tan ca
+        })
+
+    sessions.sort(key=lambda s: (s["date"], s["check_in"]), reverse=True)
+
+    # Bổ sung thống kê cho mỗi nhân viên
+    by_code_days = {}
+    last_seen = {}
+    for s in sessions:
+        by_code_days.setdefault(s["code"], set()).add(s["date"])
+        if s["code"] not in last_seen or s["date"] > last_seen[s["code"]]:
+            last_seen[s["code"]] = s["date"]
+    for e in employees:
+        e["total_days"] = len(by_code_days.get(e["code"], set()))
+        e["last_seen"] = last_seen.get(e["code"], "—")
+        e.pop("_id", None)
+
+    return sessions, employees
 
 
 # ---------------- Xây dữ liệu cho frontend ----------------
@@ -108,130 +230,78 @@ def build_data():
         return {"error": f"Chưa tìm thấy database: {DB_PATH}"}
 
     conn = connect()
-    tables = list_tables(conn)
-    if not tables:
-        return {"error": "Database rỗng (chưa có bảng nào)."}
+    try:
+        if not list_tables(conn):
+            return {"error": "Database rỗng (chưa có bảng nào)."}
+        sessions, employees = build_sessions(conn)
+    finally:
+        conn.close()
 
-    session_table = find_session_table(conn, tables)
-    att_table = session_table or find_attendance_table(conn, tables)
-    emp_table = find_employee_table(conn, tables, att_table)
+    today = date.today().isoformat()
+    today_sessions = [s for s in sessions if s["date"] == today]
 
-    att_rows, att_cols = rows_to_dicts(conn, att_table) if att_table else ([], [])
-    emp_rows, emp_cols = rows_to_dicts(conn, emp_table) if emp_table else ([], [])
+    # --- Thẻ tổng quan ---
+    checked_in_today = len({s["code"] for s in today_sessions})
+    checked_out_today = len({s["code"] for s in today_sessions if not s["open"]})
+    n_emp = len(employees) if employees else len({s["code"] for s in sessions})
 
-    name_col = find_col(att_cols, "name", "ten") or find_col(att_cols, "code", "id")
-    today = date.today()
-
-    data = {"mode": "session" if session_table else "log",
-            "db": DB_PATH, "error": None}
-
-    if session_table:
-        ci = find_col(att_cols, "check_in", "checkin")
-        co = find_col(att_cols, "check_out", "checkout")
-        dcol = find_col(att_cols, "work_date", "date")
-
-        sessions = []
-        in_hours = {}      # giờ vào hôm nay
-        day_counts = {}    # số phiên theo ngày
-        n_in = n_out = 0
-        for r in att_rows:
-            din = parse_dt(r.get(ci))
-            dout = parse_dt(r.get(co))
-            d = (parse_dt(r.get(dcol)).date() if dcol and parse_dt(r.get(dcol)) else (din.date() if din else None))
-            hours = ""
-            if din and dout:
-                hours = f"{(dout - din).total_seconds()/3600:.1f}h"
-            sessions.append({
-                "name": str(r.get(name_col, "")),
-                "date": d.isoformat() if d else "",
-                "check_in": din.strftime("%H:%M:%S") if din else "—",
-                "check_out": dout.strftime("%H:%M:%S") if dout else "—",
-                "hours": hours or "—",
-                "_today": (d == today),
-            })
-            if d == today:
-                if din:
-                    n_in += 1
-                    in_hours[din.hour] = in_hours.get(din.hour, 0) + 1
-                if dout:
-                    n_out += 1
-            if d:
-                day_counts[d] = day_counts.get(d, 0) + 1
-
-        n_emp = len(emp_rows) if emp_rows else len({s["name"] for s in sessions})
-        data["overview"] = {
-            "cards": [
-                {"label": "Nhân viên đăng ký", "value": n_emp, "icon": "👥", "color": "#4f7cff"},
-                {"label": "Đã vào làm hôm nay", "value": n_in, "icon": "🟢", "color": "#22c55e"},
-                {"label": "Đã tan ca hôm nay", "value": n_out, "icon": "🔵", "color": "#3b82f6"},
-                {"label": "Đang làm việc", "value": max(n_in - n_out, 0), "icon": "🏢", "color": "#f59e0b"},
-            ]
-        }
-        data["sessions"] = sorted(sessions, key=lambda s: (s["date"], s["check_in"]), reverse=True)
-
-        # chart giờ vào hôm nay (6h-20h)
-        data["chart_hour"] = {
-            "title": "Giờ vào làm hôm nay",
-            "labels": [f"{h}h" for h in range(6, 21)],
-            "values": [in_hours.get(h, 0) for h in range(6, 21)],
-        }
-        # chart 7 ngày
-        days = [(today - timedelta(days=i)) for i in range(6, -1, -1)]
-        data["chart_day"] = {
-            "title": "Số phiên 7 ngày qua",
-            "labels": [d.strftime("%d/%m") for d in days],
-            "values": [day_counts.get(d, 0) for d in days],
-        }
-
-    else:
-        # Chế độ log đơn giản
-        tcol = find_time_col(att_cols)
-        scol = find_col(att_cols, "sim", "score", "conf")
-        logs = []
-        hours = {}; day_counts = {}; n_today = 0; people_today = set()
-        for r in att_rows:
-            dt = parse_dt(r.get(tcol)) if tcol else None
-            logs.append({
-                "name": str(r.get(name_col, "")),
-                "time": dt.strftime("%Y-%m-%d %H:%M:%S") if dt else str(r.get(tcol, "")),
-                "sim": r.get(scol, "") if scol else "",
-            })
-            if dt and dt.date() == today:
-                n_today += 1
-                people_today.add(str(r.get(name_col, "")))
-                hours[dt.hour] = hours.get(dt.hour, 0) + 1
-            if dt:
-                day_counts[dt.date()] = day_counts.get(dt.date(), 0) + 1
-
-        n_emp = len(emp_rows) if emp_rows else len({l["name"] for l in logs})
-        data["overview"] = {"cards": [
+    overview = {
+        "today": today,
+        "cards": [
             {"label": "Nhân viên đăng ký", "value": n_emp, "icon": "👥", "color": "#4f7cff"},
-            {"label": "Lượt chấm công hôm nay", "value": n_today, "icon": "✅", "color": "#22c55e"},
-            {"label": "Số người hôm nay", "value": len(people_today), "icon": "🧑", "color": "#3b82f6"},
-            {"label": "Tổng lượt", "value": len(logs), "icon": "📈", "color": "#f59e0b"},
-        ]}
-        data["logs"] = sorted(logs, key=lambda l: l["time"], reverse=True)
-        data["chart_hour"] = {"title": "Lượt chấm công hôm nay",
-                              "labels": [f"{h}h" for h in range(6, 21)],
-                              "values": [hours.get(h, 0) for h in range(6, 21)]}
-        days = [(today - timedelta(days=i)) for i in range(6, -1, -1)]
-        data["chart_day"] = {"title": "Lượt 7 ngày qua",
-                             "labels": [d.strftime("%d/%m") for d in days],
-                             "values": [day_counts.get(d, 0) for d in days]}
+            {"label": "Đã vào làm hôm nay", "value": checked_in_today, "icon": "🟢", "color": "#22c55e"},
+            {"label": "Đã tan ca hôm nay", "value": checked_out_today, "icon": "🔵", "color": "#3b82f6"},
+            {"label": "Đang làm việc", "value": max(checked_in_today - checked_out_today, 0), "icon": "🏢", "color": "#f59e0b"},
+        ],
+    }
 
-    # Danh sách nhân viên (ẩn cột embedding)
-    emp_list = []
-    for r in emp_rows:
-        emp_list.append({k: v for k, v in r.items()
-                         if not any(x in k.lower() for x in ("embed", "vector", "feature", "blob"))})
-    data["employees"] = emp_list
-    conn.close()
-    return data
+    # --- Biểu đồ phân bố giờ VÀO LÀM (theo tất cả phiên) ---
+    in_hour = {h: 0 for h in range(DAY_START_HOUR, DAY_END_HOUR + 1)}
+    for s in sessions:
+        h = int(s["in_min"] // 60)
+        if h in in_hour:
+            in_hour[h] += 1
+    chart_checkin = {
+        "title": "Phân bố giờ vào làm",
+        "labels": [f"{h}h" for h in range(DAY_START_HOUR, DAY_END_HOUR + 1)],
+        "values": [in_hour[h] for h in range(DAY_START_HOUR, DAY_END_HOUR + 1)],
+    }
+
+    # --- Biểu đồ số phiên 14 ngày gần nhất ---
+    d0 = date.today()
+    days = [(d0 - timedelta(days=i)) for i in range(13, -1, -1)]
+    day_count = {d.isoformat(): 0 for d in days}
+    for s in sessions:
+        if s["date"] in day_count:
+            day_count[s["date"]] += 1
+    chart_days = {
+        "title": "Số phiên 14 ngày qua",
+        "labels": [d.strftime("%d/%m") for d in days],
+        "values": [day_count[d.isoformat()] for d in days],
+    }
+
+    # --- Danh sách ngày có dữ liệu (cho bộ chọn ngày của timeline) ---
+    available_dates = sorted({s["date"] for s in sessions}, reverse=True)
+
+    return {
+        "error": None,
+        "db": DB_PATH,
+        "today": today,
+        "day_window": {"start": DAY_START_HOUR, "end": DAY_END_HOUR},
+        "overview": overview,
+        "today_sessions": today_sessions,
+        "sessions": sessions,
+        "available_dates": available_dates,
+        "employees": employees,
+        "chart_checkin": chart_checkin,
+        "chart_days": chart_days,
+    }
 
 
 @app.route("/")
 def index():
     return render_template("index.html")
+
 
 @app.route("/api/data")
 def api_data():
