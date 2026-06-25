@@ -1,0 +1,30 @@
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Large model checkpoints (share via Google Drive / HuggingFace)
+checkpoints/recognition/*.pt
+
+# Runtime database (generated when running)
+attendance.db
+
+# Captured face images (privacy)
+captured_faces/
+
+# Zip archive
+*.zip
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
